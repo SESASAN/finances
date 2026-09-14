@@ -12,6 +12,8 @@
 
 # testing
 /coverage
+/playwright-report
+/test-results
 
 # next.js
 /.next/
@@ -39,3 +41,18 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# AI agent skill caches — restorable from skills-lock.json (see supabase/agent-skills),
+# do not commit: paths are machine-specific and content is duplicated per tool
+/.agents/skills
+/.claude/skills
+/.claude/settings.local.json
+
+# gentle-ai skill registry cache — auto-generated, embeds local machine paths,
+# regenerate with `gentle-ai skill-registry refresh --force`
+/.atl
+
+# editor / OS
+.vscode/
+.idea/
+Thumbs.db
