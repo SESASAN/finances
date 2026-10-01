@@ -438,6 +438,9 @@ export async function deleteTransaction(id: string, workspaceId: string) {
 - **Cron triggers externos** (si Vercel Cron > pg_cron en algún caso).
 - **Endpoints públicos** sin sesión (ej. health check).
 - **Account export/delete** (compliance, mejor como endpoint JSON).
+- **Callbacks de auth** (redirect externo con querystring: `code`, `token_hash`). Viven en
+  `app/auth/*`, **no** en `app/api/*`, porque responden `303 Location` y no JSON, y su URL es
+  configuración externa (Google Console + allow-list de redirects de Supabase): tiene que ser estable.
 
 ---
 
@@ -451,23 +454,49 @@ Supabase Auth con cookies (server-side friendly via `@supabase/ssr`):
 - Confirmación de email **obligatoria** post-signup (reduce spam/abuse).
 - Password reset vía Supabase default.
 
-### Middleware (`lib/auth/middleware.ts`)
+### Proxy (`proxy.ts` en la raíz → `lib/auth/session-proxy.ts`)
 
-```ts
-// Pseudocódigo
-if (path.startsWith('/(app)')) {
-  const session = await getSession()
-  if (!session) redirect('/login')
-  const workspace = await loadWorkspaceFromUrl()
-  if (!workspace) redirect('/onboarding')
-  request.headers.set('x-workspace-id', workspace.id)
-}
-```
+> **Next.js 16**: el fichero `middleware.ts` está **deprecado** y se llama `proxy.ts`; el export
+> se llama `proxy`, no `middleware`. Además el Proxy corre por defecto en el runtime **Node.js**
+> (no Edge), y poner `export const runtime` en un fichero de Proxy lanza error.
+
+Dos capas, separadas a propósito:
+
+**Capa 1 — `proxy.ts`: refresco de sesión + redirect de conveniencia. Nada más.**
+Construye el cliente SSR con `getAll`/`setAll`, llama a `supabase.auth.getUser()` y devuelve
+**el mismo objeto `NextResponse` sobre el que Supabase escribió las cookies**. Devolver un
+`NextResponse` nuevo descarta en silencio la sesión refrescada (bug clásico de `@supabase/ssr`:
+logouts aleatorios). `setAll` recibe un segundo argumento `headers` con `Cache-Control`/`Expires`/
+`Pragma`: hay que aplicarlos, o un CDN puede cachear el `Set-Cookie` de un usuario y servírselo a
+otro. La decisión de redirect vive en `resolveAuthRedirect()`, función pura y testeada.
+
+**Capa 2 — `app/(app)/[workspace]/layout.tsx`: resolución de workspace.**
+Cargar el workspace, redirigir a `/onboarding` y propagar `x-workspace-id` **no** son tarea del
+Proxy. Pertenecen a `features/workspaces` (el Proxy es de `features/auth`), y meterlos ahí obliga a
+una query a Postgres por request en el camino crítico de *todas* las rutas, incluidas las públicas,
+para un dato que el segmento necesita una sola vez. Se hacen en el layout del segmento.
+
+#### Regla no negociable: el Proxy es UX, nunca un límite de autorización
+
+El Proxy es una conveniencia de redirect. Se puede saltear (los bypass de middleware por spoofing
+de headers son una clase conocida de CVE en Next.js) y **no corre nunca** para una llamada directa
+a PostgREST / Data API. Por lo tanto:
+
+- Todo Server Component y toda Server Action rederiva la identidad con `supabase.auth.getUser()`
+  — **nunca** `getSession()`, que confía en una cookie sin verificar.
+- RLS sigue siendo el único límite real. Misma lección que
+  `db/policies/0002_workspace_members_role_gating.sql`: un chequeo en la capa de aplicación **no**
+  neutraliza un agujero de RLS.
+- `raw_user_meta_data` y `profiles.name` son **editables por el usuario**: nunca usarlos en una
+  decisión de autorización. Los datos de autorización van en `app_metadata` o en tablas propias
+  con RLS. `profiles.email` es un espejo de `auth.users.email` y es inmutable desde el cliente
+  (`trg_prevent_profile_email_change`, migración 0003).
 
 Rutas:
-- `(marketing)/`, `(auth)/`: públicas.
-- `(app)/[workspace]/*`: requieren sesión + workspace válido.
-- `admin/`: requiere user con flag `is_admin = true`.
+- `(marketing)/`, `(auth)/`, `app/auth/*`: públicas.
+- `(app)/[workspace]/*`: requieren sesión (el Proxy redirige a `/login?next=…`) + workspace válido
+  (lo valida el layout) + RLS.
+- `admin/`: requiere `profiles.is_admin = true`, verificado en el servidor. **No** en el Proxy.
 
 ---
 
@@ -597,6 +626,10 @@ Una feature está "done" cuando:
 | 2026-07-25 | Sin Redis inicialmente | `unstable_cache` de Next.js cubre hasta dolor real | Si cache hit rate <80% o latencia >500ms |
 | 2026-07-25 | `Money` class con BigInt | Evita errores de precisión en operaciones monetarias | Nunca (es una invariante del dominio) |
 | 2026-07-25 | NUMERIC(15,2) en DB | Nunca FLOAT para dinero | Nunca |
+| 2026-09-14 | `profiles.email` inmutable desde el cliente (trigger + sync desde `auth.users`) | `profiles_update_self` no restringe columnas: un PATCH directo a PostgREST podía falsear el email espejo; se vuelve account-takeover cuando las invitaciones matcheen por email | Nunca (invariante); revisar si `auth.users` deja de ser la fuente de verdad |
+| 2026-09-14 | Aceptar filas huérfanas en `profiles` de signups sin confirmar | Sin confirmar no hay sesión ⇒ no hay `auth.uid()` ⇒ RLS niega todo, y `anon` no tiene policy; `on delete cascade` las limpia junto al `auth.users` | Si son una porción medible de `profiles`, o si algo busca por `profiles.email` en vez de `auth.users.email` |
+| 2026-09-14 | Dos route handlers de callback: `/auth/callback` (PKCE `code`) y `/auth/confirm` (`token_hash`) | El verifier PKCE vive en una cookie del navegador que inició el flujo; un link de email se abre rutinariamente en otro navegador o en un preview de webmail | Si Supabase unifica ambos flujos |
+| 2026-09-14 | `proxy.ts` en vez de `middleware.ts` | `middleware` está deprecado en Next 16 y renombrado a `proxy`; además el Proxy corre en Node.js runtime por defecto | Cuando Next elimine el alias `middleware` |
 
 ---
 
@@ -612,6 +645,8 @@ Una feature está "done" cuando:
 - [ ] **Política de reembolso** (propuesta: 7 días)
 - [ ] **Trial period** (propuesta: 14 días para Pro al registrarse)
 - [ ] **Confirmar si se cobra anual** (propuesta: v1 solo mensual)
+- [ ] Migrar `NEXT_PUBLIC_SUPABASE_ANON_KEY` a **publishable key** (Supabase recomienda publishable para frontend; anon es legacy/compat)
+- [ ] Confirmar el toggle **Confirm phone** en el dashboard: decide si `signUp` de un email ya registrado devuelve usuario ofuscado o error `user_already_exists` (el código maneja ambos, pero conviene saber cuál es)
 
 ---
 
@@ -628,7 +663,12 @@ NO hacer en este proyecto:
 - ❌ `FLOAT` / `DOUBLE PRECISION` para montos en DB (usar `NUMERIC(15,2)`)
 - ❌ Hard delete sin `deleted_at` en tablas de dominio
 - ❌ Hardcoded secrets en código o commits
-- ❌ API routes internas (todo via Server Actions)
+- ❌ API routes internas para **mutaciones iniciadas por el usuario** (eso va en Server Actions).
+  **Excepción permitida**: endpoints que reciben un *redirect externo* o un *webhook*. Son GET/POST
+  del navegador o de un tercero contra una URL estable, y no pueden ser Server Actions: una Server
+  Action es un POST opaco, protegido por CSRF token y ligado a un `<form>`, así que no puede ser el
+  destino de un redirect externo. Hoy: `app/auth/callback/` (OAuth PKCE) y `app/auth/confirm/`
+  (links de email de Supabase), más `app/api/webhooks/*`.
 - ❌ Context API para estado que cambia seguido (usar Zustand si crece)
 - ❌ `any` sin justificación documentada en comentario
 - ❌ Cálculos de saldo/% presupuesto en cliente (siempre del servidor)
